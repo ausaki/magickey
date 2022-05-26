@@ -1,0 +1,30 @@
+[flake8]
+extend-select = C4,I25
+max-line-length = 88
+# Enable flake8-logging-format
+enable-extensions = G
+# Ignore rules that are not compatible with PEP 8 according to Black:
+# * E203 whitespace before ':'.  See https://github.com/ambv/black/issues/315
+# * W503 line break before binary operator. See https://github.com/ambv/black/issues/52
+# Ignore rules which are too aggressive:
+# * B006 (flake8-bugbear) Do not use mutable data structures for argument defaults
+# * B008 (flake8-bugbear) Do not perform function calls in argument defaults
+# * D10 (flake8-docstrings) Missing Docstrings
+# * D400 (flake8-docstrings) First line should end with a period
+# * G200 (flake8-logging-format): Logging statements should not include the
+#    exception in logged string (use exception or exc_info=True)
+# * PT001 (flake8-pytest-style): use @pytest.fixture() over @pytest.fixture
+# * PT004 (flake8-pytest-style): fixture does not return anything, add leading underscore
+ignore = E203,W503,B006,B008,D10,D400,G200,PT001,PT004
+# Config flake8-pytest-style
+pytest-parametrize-names-type = csv
+# Config flake8-tidy-imports
+ban-relative-imports = parents
+per-file-ignores =
+  scripts/*.py:T001
+
+# flake8-quotes
+inline-quote = double
+multiline-quote = """
+docstring-quotes = """
+avoid-escape = True

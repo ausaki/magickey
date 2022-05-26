@@ -3,5 +3,6 @@ Description=Magickey -- remapping keys
 
 [Service]
 Type=simple
-ExecStart=magickey
+User=root
+ExecStart=%h/.local/bin/magickey -c %h/.config/magickey/conf.json
 
