@@ -1,0 +1,7 @@
+[Unit]
+Description=Magickey -- remapping keys
+
+[Service]
+Type=simple
+ExecStart=magickey
+
