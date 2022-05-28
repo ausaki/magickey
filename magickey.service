@@ -3,6 +3,5 @@ Description=Magickey -- remapping keys
 
 [Service]
 Type=simple
-User=root
-ExecStart=%h/.local/bin/magickey -c %h/.config/magickey/conf.json
+ExecStart=python /home/jamielu/Workspace/magickey/magickey.py -c /home/jamielu/.config/magickey/conf.json -d
 
