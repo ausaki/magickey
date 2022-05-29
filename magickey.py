@@ -6,7 +6,12 @@ import dataclasses
 import json
 import logging
 import logging.config
+import os
+import pwd
+import re
 import signal
+import socket
+import struct
 import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -46,6 +51,221 @@ logging.config.dictConfig(
 logger = logging.getLogger('magickeyboard')
 
 
+class Window:
+    def __init__(self, class_: str, title: str):
+        self.class_ = class_
+        self.title = title
+
+    def match(self, class_pattern: str = '', title_pattern: str = '') -> bool:
+        return bool(re.search(class_pattern, self.class_)) and bool(
+            re.search(title_pattern, self.title)
+        )
+
+    def match_or(self, class_pattern: str = '', title_pattern: str = '') -> bool:
+        return bool(re.search(class_pattern, self.class_)) or bool(
+            re.search(title_pattern, self.title)
+        )
+
+    def match_not(self, class_pattern: str = '', title_pattern: str = '') -> bool:
+        return not bool(re.search(class_pattern, self.class_)) and not bool(
+            re.search(title_pattern, self.title)
+        )
+
+    def match_not_or(self, class_pattern: str = '', title_pattern: str = '') -> bool:
+        return not bool(re.search(class_pattern, self.class_)) or not bool(
+            re.search(title_pattern, self.title)
+        )
+
+    def __str__(self) -> str:
+        return f'{self.class_} {self.title}'
+
+
+class SwayClient:
+    IPC_MAGIC = b'i3-ipc'
+    IPC_HEADER_SIZE = 14
+    IPC_HEADER_FMT = '<6s2I'
+
+    IPC_COMMAND = 0
+    IPC_GET_WORKSPACES = 1
+    IPC_SUBSCRIBE = 2
+    IPC_GET_OUTPUTS = 3
+    IPC_GET_TREE = 4
+    IPC_GET_MARKS = 5
+    IPC_GET_BAR_CONFIG = 6
+    IPC_GET_VERSION = 7
+    IPC_GET_BINDING_MODES = 8
+    IPC_GET_CONFIG = 9
+    IPC_SEND_TICK = 10
+    IPC_SYNC = 11
+    IPC_GET_BINDING_STATE = 12
+
+    # sway-specific command types
+    IPC_GET_INPUTS = 100
+    IPC_GET_SEATS = 101
+
+    # Events sent from sway to clients. Events have the highest bits set.
+    IPC_EVENT_WORKSPACE = (1 << 31) | 0
+    IPC_EVENT_OUTPUT = (1 << 31) | 1
+    IPC_EVENT_MODE = (1 << 31) | 2
+    IPC_EVENT_WINDOW = (1 << 31) | 3
+    IPC_EVENT_BARCONFIG_UPDATE = (1 << 31) | 4
+    IPC_EVENT_BINDING = (1 << 31) | 5
+    IPC_EVENT_SHUTDOWN = (1 << 31) | 6
+    IPC_EVENT_TICK = (1 << 31) | 7
+
+    # sway-specific event types
+    IPC_EVENT_BAR_STATE_UPDATE = (1 << 31) | 20
+    IPC_EVENT_INPUT = (1 << 31) | 21
+
+    def __init__(
+        self, evloop: Optional[asyncio.AbstractEventLoop] = None, uid: int = -1
+    ) -> None:
+        self.uid = uid
+        self.socket_path = self._get_socket_path(uid)
+        self.client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.client.setblocking(False)
+        self.focused_window = Window('', '')
+        self.evloop = evloop or asyncio.get_event_loop()
+
+        self._connected = False
+        self._subscribe_task: Optional[asyncio.Task[None]] = None
+
+    @classmethod
+    def _get_socket_path(cls, uid: int) -> str:
+        if socket_path := os.environ.get('SWAYSOCK'):
+            return socket_path
+
+        files = list(Path(f'/run/user/{uid}').glob(f'sway-ipc.{uid}.*.sock'))
+        if files:
+            return files[0].as_posix()
+        else:
+            raise RuntimeError('failed to get sway socket path')
+
+    async def connect(self) -> None:
+        await self.evloop.sock_connect(self.client, self.socket_path)
+        self._connected = True
+
+    def close(self) -> None:
+        self.client.close()
+        self._connected = False
+        self.stop_subscribe()
+
+    def __del__(self) -> None:
+        self.close()
+
+    async def send(self, command_type: int, command: bytes) -> None:
+        if not self._connected:
+            await self.connect()
+
+        command_header = struct.pack(
+            self.IPC_HEADER_FMT, self.IPC_MAGIC, len(command), command_type
+        )
+        await self.evloop.sock_sendall(self.client, command_header)
+        await self.evloop.sock_sendall(self.client, command)
+
+    async def recv(self) -> bytes:
+        response_header = b''
+        while len(response_header) < self.IPC_HEADER_SIZE:
+            chunk = await self.evloop.sock_recv(
+                self.client, self.IPC_HEADER_SIZE - len(response_header)
+            )
+            if not chunk:
+                logger.error('failed to receive sway command response header')
+                return b''
+
+            response_header += chunk
+
+        magic, response_length, response_type = struct.unpack(
+            self.IPC_HEADER_FMT, response_header
+        )
+        if magic != self.IPC_MAGIC:
+            logger.error('invalid response magic %s', magic)
+            return b''
+
+        payload = b''
+        while len(payload) < response_length:
+            chunk = await self.evloop.sock_recv(
+                self.client, response_length - len(payload)
+            )
+            if not chunk:
+                logger.error(
+                    'failed to receive response payload, already read %s bytes',
+                    len(payload),
+                )
+                return b''
+
+            payload += chunk
+
+        return payload
+
+    def _find_focused_window(self, tree: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if tree['type'] in {'con', 'floating_con'} and tree['focused']:
+            return tree
+
+        for node in tree['floating_nodes']:
+            if res := self._find_focused_window(node):
+                return res
+
+        for node in tree['nodes']:
+            if res := self._find_focused_window(node):
+                return res
+
+        return None
+
+    async def get_active_window_once(self) -> Optional[Window]:
+        await self.send(self.IPC_GET_TREE, b'')
+        output = await self.recv()
+        tree = json.loads(output)
+        window = self._find_focused_window(tree)
+        if not window:
+            return None
+
+        if window['shell'] == 'xdg_shell':
+            class_ = window.get('app_id', '')
+        else:
+            class_ = window.get('window_properties', {}).get('class')
+        title = window.get('name', '')
+
+        return Window(class_, title)
+
+    async def _subscribe(self) -> None:
+        await self.send(self.IPC_SUBSCRIBE, json.dumps(['window']).encode('utf8'))
+        payload = await self.recv()
+        resp = json.loads(payload)
+        if not resp['success']:
+            logger.error('failed to subscribe to events ["window"]')
+            return
+
+        while True:
+            payload = await self.recv()
+            event = json.loads(payload)
+
+            if event['change'] == 'shutdown':
+                break
+
+            if event['change'] != 'focus':
+                continue
+
+            window = event['container']
+            if window['shell'] == 'xdg_shell':
+                self.focused_window.class_ = window.get('app_id', '')
+            else:
+                self.focused_window.class_ = window.get('window_properties', {}).get(
+                    'class'
+                )
+            self.focused_window.title = window.get('name', '')
+
+    def subscribe(self) -> None:
+        self._subscribe_task = self.evloop.create_task(self._subscribe())
+
+    def stop_subscribe(self) -> bool:
+        if self._subscribe_task:
+            self._subscribe_task.cancel()
+            self._subscribe_task = None
+
+        return True
+
+
 class KeyState(IntEnum):
     up = 0
     down = 1
@@ -63,6 +283,48 @@ class KeyMapping:
     src_key: int
     dst_modifiers: set[int]
     dst_key: int
+    match: Dict[str, str]
+    match_or: Dict[str, str]
+    match_not: Dict[str, str]
+    match_not_or: Dict[str, str]
+
+    def is_match(self, modifiers: set[int], key: int, window: Window) -> bool:
+        res = self.src_modifiers == modifiers and self.src_key == key
+        if not res:
+            return res
+
+        if not (window.title or window.class_):
+            return res
+
+        logger.debug('matching %s %s %s %s', modifiers, key, window, self.match_not)
+        for m in ['match', 'match_or', 'match_not', 'match_not_or']:
+            if not (patterns := getattr(self, m)):
+                continue
+
+            class_pattern = patterns.get('class')
+            title_pattern = patterns.get('title')
+            c, t = None, None
+
+            if class_pattern and window.class_:
+                c = bool(re.search(class_pattern, window.class_))
+                if 'not' in m:
+                    c = not c
+            if title_pattern and window.title:
+                t = bool(re.search(title_pattern, window.title))
+                if 'not' in m:
+                    t = not t
+
+            if c is None and t is None:
+                return res
+
+            if 'or' in m:
+                return (c if c is not None else False) or (
+                    t if t is not None else False
+                )
+
+            return (c if c is not None else True) and (t if t is not None else True)
+
+        return res
 
     def __str__(self) -> str:
         src = [MagicKeyboard.keycode_to_name(k) for k in self.src_modifiers]
@@ -109,7 +371,9 @@ class KeyboardMapping:
     input_device: evdev.InputDevice
     output_device: evdev.InputDevice
     state: KeyboardMappingState
-    # _all_modifiers is built from key_mappings[*].src_modifiers, see parse_config
+    sway_client: SwayClient
+    evloop: asyncio.AbstractEventLoop
+
     _all_modifiers: Set[int]
     _active_modifiers: Dict[int, ActiveKeyInfo]
     _active_keys: Dict[int, ActiveKeyInfo]
@@ -117,12 +381,21 @@ class KeyboardMapping:
     _matched_key_mapping: Optional[KeyMapping]
     _async_task: Optional[asyncio.Task[None]]
 
-    def __init__(self, keyboard_name: str, key_mappings: List[KeyMapping]) -> None:
+    def __init__(
+        self,
+        keyboard_name: str,
+        key_mappings: List[KeyMapping],
+        sway_client: SwayClient,
+        evloop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
         self.keyboard_name = keyboard_name
         self.key_mappings = key_mappings
         self.input_device = None
         self.output_device = None
         self.state = KeyboardMappingState.PRE_MATCH_PRESSED_KEY
+
+        self.sway_client = sway_client
+        self.evloop = evloop or asyncio.get_event_loop()
 
         self._all_modifiers = set()
         self._active_modifiers = {}
@@ -170,9 +443,8 @@ class KeyboardMapping:
 
     def match(self, src_modifiers: set[int], src_key: int) -> Optional[KeyMapping]:
         for key_mapping in self.key_mappings:
-            if (
-                src_modifiers == key_mapping.src_modifiers
-                and src_key == key_mapping.src_key
+            if key_mapping.is_match(
+                src_modifiers, src_key, self.sway_client.focused_window
             ):
                 return key_mapping
 
@@ -199,9 +471,10 @@ class KeyboardMapping:
         # start here keycode is a modifier
         if keystate in {KeyState.down, KeyState.hold}:
             self._active_modifiers[keycode] = ActiveKeyInfo(keystate, time.time(), 1)
-            self.send_key(keycode, keystate)
-            self.output_device.syn()
             self.state = KeyboardMappingState.PRE_MATCH_PRESSED_MODIFIER
+            if keycode in {MagicKeyboard.MODIFIERS['left_shift'], MagicKeyboard.MODIFIERS['right_shift']}:
+                self.send_key(keycode, keystate)
+                self.output_device.syn()
         else:
             logger.warning(
                 '%s unexpected key: %s %s',
@@ -257,8 +530,9 @@ class KeyboardMapping:
             self._matched_key_mapping = matched_key_mapping
 
         # release active modifiers
-        self.send_keys(list(self._active_modifiers), KeyState.up)
-        self.output_device.syn()
+        if matched_key_mapping:
+            self.send_keys(list(self._active_modifiers), KeyState.up)
+            self.output_device.syn()
 
         if keystate in {KeyState.down, KeyState.hold}:
             self.send_keys(list(dst_modifiers), KeyState.down)
@@ -281,19 +555,20 @@ class KeyboardMapping:
                     keycode, ActiveKeyInfo(keystate, time.time(), 0)
                 )
                 info.count += 1
-                self.send_key(keycode, keystate)
-                self.output_device.syn()
+                if info.count > 20:
+                    self.send_key(keycode, keystate)
+                    self.output_device.syn()
                 return
 
             # start here keystate == KeyState.up
             info = self._active_modifiers.pop(keycode, None)  # type: ignore
             if info:
+                self.send_key(keycode, info.state)
                 self.send_key(keycode, keystate)
                 self.output_device.syn()
 
             if not self._active_modifiers:
                 self.state = KeyboardMappingState.PRE_MATCH_INIT
-
             return
 
         # start here keycode is not modifier
@@ -411,7 +686,7 @@ class KeyboardMapping:
             self.input_device.close()
             self.input_device = None
 
-    def grab(self, evloop: asyncio.AbstractEventLoop) -> None:
+    def grab(self) -> None:
         dev = self.find_input_device()
 
         if dev is None:
@@ -446,13 +721,11 @@ class KeyboardMapping:
             self.input_device, name=f'magickey-{self.input_device.name}'
         )
 
-        self._async_task = evloop.create_task(self._handle_input_events())
+        self._async_task = self.evloop.create_task(self._handle_input_events())
 
     def ungrab(self) -> bool:
         if self.state != KeyboardMappingState.PRE_MATCH_INIT:
-            logger.debug(
-                'can not ungrab <%s> on %s', self.keyboard_name, self.state
-            )
+            logger.debug('can not ungrab <%s> on %s', self.keyboard_name, self.state)
             return False
 
         if self.input_device:
@@ -500,10 +773,15 @@ class MagicKeyboard:
 
     MODIFIER_KEY_CODES = set(MODIFIERS.values())
 
-    def __init__(self, config_file: Union[Path, IO[str]]) -> None:
-        self.parse_config(config_file)
+    keyboard_mappings: List[KeyboardMapping]
+    sway_client: SwayClient
 
+    def __init__(self, config_file: Union[Path, IO[str]], uid: int = -1) -> None:
+        self.uid = uid if uid >= 0 else os.getuid()
         self.evloop = asyncio.get_event_loop_policy().get_event_loop()
+        self.sway_client = SwayClient(self.evloop, self.uid)
+
+        self.parse_config(config_file)
 
     @classmethod
     def normalize_key(cls, key_name: str) -> int:
@@ -528,21 +806,33 @@ class MagicKeyboard:
         return keycode in cls.MODIFIERS
 
     @classmethod
-    def split_key_combination(cls, key_combination: str) -> Tuple[Set[int], int]:
-        keys = key_combination.split('+')
-        modifiers = set()
-        _key = -1
+    def split_key_combination(
+        cls, key_combination: str, is_src: bool = True
+    ) -> Tuple[Set[int], int]:
+        _keys = key_combination.split('+')
+        modifiers = []
+        keys = []
 
-        for key in keys:
+        for key in _keys:
             key = key.strip().lower()
             keycode = cls.normalize_key(key)
 
             if cls.is_modifier(keycode):
-                modifiers.add(keycode)
+                modifiers.append(keycode)
             else:
-                _key = keycode
+                keys.append(keycode)
 
-        return modifiers, _key
+        modifiers_set = set(modifiers)
+        if is_src and not modifiers_set:
+            raise RuntimeError(f'no modifier in key combination: {key_combination}')
+        if not keys:
+            raise RuntimeError(f'no key in key combination: {key_combination}')
+        if len(modifiers_set) != len(modifiers):
+            raise RuntimeError(f'find duplicate modifiers: {key_combination}')
+        if len(keys) != 1:
+            raise RuntimeError(f'find more than one key: {key_combination}')
+
+        return modifiers_set, keys[0]
 
     @classmethod
     def find_all_keyboards(cls) -> List[str]:
@@ -573,9 +863,29 @@ class MagicKeyboard:
             for mapping in mappings:
                 src = mapping['src']
                 dst = mapping['dst']
+                match = mapping.get('match', {})
+                match_or = mapping.get('match_or', {})
+                match_not = mapping.get('match_not', {})
+                match_not_or = mapping.get('match_not_or', {})
+                all_true = [m for m in [match, match_or, match_not, match_not_or] if m]
+                if len(all_true) > 1:
+                    raise RuntimeError(
+                        f'find multiple match conditions in key mapping({src} -> {dst})'
+                        f'{all_true}'
+                    )
+
                 src_modifiers, src_key = self.split_key_combination(src)
-                dst_modifiers, dst_key = self.split_key_combination(dst)
-                key_mapping = KeyMapping(src_modifiers, src_key, dst_modifiers, dst_key)
+                dst_modifiers, dst_key = self.split_key_combination(dst, False)
+                key_mapping = KeyMapping(
+                    src_modifiers,
+                    src_key,
+                    dst_modifiers,
+                    dst_key,
+                    match,
+                    match_or,
+                    match_not,
+                    match_not_or,
+                )
                 key_mappings.append(key_mapping)
 
             # get keyboards
@@ -584,7 +894,9 @@ class MagicKeyboard:
                 continue
 
             for keyboard in keyboards:
-                keyboard_mapping = KeyboardMapping(keyboard, key_mappings)
+                keyboard_mapping = KeyboardMapping(
+                    keyboard, key_mappings, self.sway_client, self.evloop
+                )
                 keyboard_mapping.set_all_modifiers()
                 keyboard_mappings.append(keyboard_mapping)
 
@@ -602,9 +914,11 @@ class MagicKeyboard:
             self.evloop.stop()
             return
 
-        if all(
+        ok = all(
             keyboard_mapping.ungrab() for keyboard_mapping in self.keyboard_mappings
-        ):
+        )
+        self.sway_client.close()
+        if ok:
             self.evloop.stop()
             return
 
@@ -623,7 +937,7 @@ class MagicKeyboard:
         logger.info('udev event: %s', device)
 
         for keyboard_mapping in self.keyboard_mappings:
-            keyboard_mapping.grab(self.evloop)
+            keyboard_mapping.grab()
 
     def monitor_udev(self) -> None:
         context = pyudev.Context()
@@ -636,8 +950,9 @@ class MagicKeyboard:
     def run_forever(self) -> None:
         self.evloop.add_signal_handler(signal.SIGTERM, self.handle_SIGTERM)
         self.monitor_udev()
+        self.sway_client.subscribe()
         for keyboard_mapping in self.keyboard_mappings:
-            keyboard_mapping.grab(self.evloop)
+            keyboard_mapping.grab()
         self.evloop.run_forever()
 
 
@@ -680,7 +995,6 @@ def read_events(req_device: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser('MagicKeyboard')
-    parser.add_argument('-c', '--config', default='./magickey.conf', help='Config file')
     parser.add_argument(
         '-l',
         '--list-devices',
@@ -697,6 +1011,14 @@ def main() -> None:
     parser.add_argument(
         '-d', '--debug', action='store_true', default=False, help='print debug messages'
     )
+    parser.add_argument('-c', '--config', default='./magickey.conf', help='Config file')
+    parser.add_argument(
+        '-u',
+        '--uid',
+        default='-1',
+        help='use uid to get sway socket path and '
+        'config file in $HOME/.config/magickey/conf.json',
+    )
 
     args = parser.parse_args()
 
@@ -711,8 +1033,13 @@ def main() -> None:
         read_events(args.read_events)
         return
 
+    uid = int(args.uid)
+    if uid < 0:
+        uid = os.getuid()
+    user_name = pwd.getpwuid(uid).pw_name
+
     config = Path('/')  # make mypy happy
-    config_files = [args.config, '~/.config/magickey/conf.json']
+    config_files = [args.config, f'/home/{user_name}/.config/magickey/conf.json']
     for f in config_files:
         config = Path(f).expanduser()
         if config.exists():
@@ -721,7 +1048,7 @@ def main() -> None:
         logger.error('Config file not found, tried %s', ', '.join(config_files))
         return
 
-    MagicKeyboard(config).run_forever()
+    MagicKeyboard(config, uid).run_forever()
 
 
 if __name__ == '__main__':
