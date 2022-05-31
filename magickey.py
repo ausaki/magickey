@@ -363,6 +363,7 @@ class ActiveKeyInfo:
     state: KeyState = KeyState.down
     first_pressed_time: float = dataclasses.field(default_factory=time.time)
     count: int = 1
+    send_out: bool = False
 
 
 class KeyboardMapping:
@@ -377,8 +378,6 @@ class KeyboardMapping:
     _all_modifiers: Set[int]
     _active_modifiers: Dict[int, ActiveKeyInfo]
     _active_keys: Dict[int, ActiveKeyInfo]
-    _copy_modifiers: Dict[int, ActiveKeyInfo]
-    _matched_key_mapping: Optional[KeyMapping]
     _async_task: Optional[asyncio.Task[None]]
 
     def __init__(
@@ -400,8 +399,6 @@ class KeyboardMapping:
         self._all_modifiers = set()
         self._active_modifiers = {}
         self._active_keys = {}
-        self._copy_modifiers = {}
-        self._matched_key_mapping = None
         self._async_task = None
 
     def __str__(self) -> str:
@@ -470,11 +467,12 @@ class KeyboardMapping:
 
         # start here keycode is a modifier
         if keystate in {KeyState.down, KeyState.hold}:
-            self._active_modifiers[keycode] = ActiveKeyInfo(keystate, time.time(), 1)
+            self.send_key(keycode, keystate)
+            self.output_device.syn()
+            self._active_modifiers[keycode] = ActiveKeyInfo(
+                keystate, time.time(), 1, True
+            )
             self.state = KeyboardMappingState.PRE_MATCH_PRESSED_MODIFIER
-            if keycode in {MagicKeyboard.MODIFIERS['left_shift'], MagicKeyboard.MODIFIERS['right_shift']}:
-                self.send_key(keycode, keystate)
-                self.output_device.syn()
         else:
             logger.warning(
                 '%s unexpected key: %s %s',
@@ -509,7 +507,6 @@ class KeyboardMapping:
 
     def try_match_key(self, keycode: int, keyname: str, keystate: KeyState) -> None:
         old_state = self.state
-        self._copy_modifiers = dict(self._active_modifiers)
         matched_key_mapping = self.match(set(self._active_modifiers), keycode)
 
         logger.debug(
@@ -527,16 +524,22 @@ class KeyboardMapping:
             dst_modifiers = matched_key_mapping.dst_modifiers  # type: ignore
             dst_key = matched_key_mapping.dst_key
             self.state = KeyboardMappingState.MATCHED
-            self._matched_key_mapping = matched_key_mapping
-
-        # release active modifiers
-        if matched_key_mapping:
-            self.send_keys(list(self._active_modifiers), KeyState.up)
-            self.output_device.syn()
 
         if keystate in {KeyState.down, KeyState.hold}:
-            self.send_keys(list(dst_modifiers), KeyState.down)
-            self.send_key(dst_key, keystate)
+            if old_state == KeyboardMappingState.PRE_MATCH_PRESSED_MODIFIER:
+                for key, info in self._active_modifiers.items():
+                    if info.send_out and key not in dst_modifiers:
+                        self.up_key(key)
+
+                for key in dst_modifiers:
+                    if (info := self._active_modifiers.get(key)) and info.send_out:  # type: ignore # noqa
+                        continue
+                    self.down_key(key)
+            else:
+                self.send_keys(list(dst_modifiers), KeyState.down)
+            self.down_key(dst_key)
+            self.up_key(dst_key)
+            self.send_keys(list(dst_modifiers), KeyState.up)
             self.output_device.syn()
         else:
             logger.warning(
@@ -555,17 +558,12 @@ class KeyboardMapping:
                     keycode, ActiveKeyInfo(keystate, time.time(), 0)
                 )
                 info.count += 1
-                if info.count > 20:
-                    self.send_key(keycode, keystate)
-                    self.output_device.syn()
-                return
+                info.send_out = True
+            else:
+                info = self._active_modifiers.pop(keycode, None)  # type: ignore
 
-            # start here keystate == KeyState.up
-            info = self._active_modifiers.pop(keycode, None)  # type: ignore
-            if info:
-                self.send_key(keycode, info.state)
-                self.send_key(keycode, keystate)
-                self.output_device.syn()
+            self.send_key(keycode, keystate)
+            self.output_device.syn()
 
             if not self._active_modifiers:
                 self.state = KeyboardMappingState.PRE_MATCH_INIT
@@ -589,34 +587,16 @@ class KeyboardMapping:
 
         # start here keycode is not modifier
         if keystate in {KeyState.down, KeyState.hold}:
-            logger.warning(
-                '%s unexpected key: %s %s',
+            logger.debug(
+                'overlap key mappings: %s %s %s %s',
                 self.state,
+                list(self._active_modifiers.keys()),
                 keyname,
                 keystate,
             )
-            return
+            self.try_match_key(keycode, keyname, keystate)
 
-        dst_key = (
-            self._matched_key_mapping.dst_key  # type: ignore
-            if self.state == KeyboardMappingState.MATCHED
-            else keycode
-        )
-        self.send_key(dst_key, keystate)
-        dst_modifiers = (
-            self._matched_key_mapping.dst_modifiers  # type: ignore
-            if self.state == KeyboardMappingState.MATCHED
-            else self._copy_modifiers.keys()
-        )
-        self.send_keys(list(dst_modifiers), KeyState.up)
-        self.output_device.syn()
-
-        self._matched_key_mapping = None
-        self._copy_modifiers.clear()
-
-        if self._active_modifiers:
-            self.state = KeyboardMappingState.AFTER_MATCH
-        else:
+        if not self._active_modifiers:
             self.state = KeyboardMappingState.PRE_MATCH_INIT
 
         return
