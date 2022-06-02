@@ -1,0 +1,6 @@
+[Unit]
+Description=Magickey -- remapping keys
+
+[Service]
+Type=simple
+ExecStart=python /path/to/magickey.py -u YOUR_UID
