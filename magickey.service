@@ -1,6 +1,0 @@
-[Unit]
-Description=Magickey -- remapping keys
-
-[Service]
-Type=simple
-ExecStart=python /home/jamielu/Workspace/magickey/magickey.py -u 1000
